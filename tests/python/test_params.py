@@ -20,10 +20,11 @@ def load_parquet(filename):
     snd_df = snd_df[snd_df["relh"].notna()]
     snd_df = snd_df[snd_df["pres"] >= 50.0]
 
-    pres = snd_df["pres"].to_numpy().astype('float32')*100.0
+    pres = snd_df["pres"].to_numpy().astype('float32')*np.float32(100.0)
     hght = snd_df["hght"].to_numpy().astype('float32')
-    tmpk = snd_df["tmpc"].to_numpy().astype('float32')+273.15
-    dwpk = snd_df["dwpc"].to_numpy().astype('float32')+273.15
+    tmpk = snd_df["tmpc"].to_numpy().astype('float32')+np.float32(273.15)
+    dwpk = snd_df["dwpc"].to_numpy().astype('float32')+np.float32(273.15)
+    relh = snd_df["relh"].to_numpy().astype('float32')
     wdir = snd_df["wdir"].to_numpy().astype('float32')
     wspd = snd_df["wspd"].to_numpy().astype('float32')
     uwin = snd_df["uwin"].to_numpy().astype('float32')
@@ -37,10 +38,17 @@ def load_parquet(filename):
     # vwin = np.empty(wspd.shape, dtype="float32")
     mixr = thermo.mixratio(pres, dwpk)
     vtmp = thermo.virtual_temperature(tmpk, mixr)
+    thetae = thermo.thetae(
+        pres,
+        tmpk,
+        dwpk
+    )
 
     return {
         "pres": pres, "hght": hght,
         "tmpk": tmpk, "mixr": mixr,
+        "relh": relh,
+        "thetae": thetae,
         "vtmp": vtmp, "dwpk": dwpk,
         "wdir": wdir, "wspd": wspd,
         "uwin": uwin, "vwin": vwin
@@ -78,7 +86,7 @@ def test_effective_inflow_layer_wobus():
     assert (eil.bottom == pytest.approx(92043.0))
     assert (eil.top == pytest.approx(83384.0))
     assert (mupcl.cape == pytest.approx(3353.4, abs=5e-1))
-    assert (mupcl.cinh == pytest.approx(-34.5697, abs=5e-4))
+    assert (mupcl.cinh == pytest.approx(-34.5707, abs=5e-4))
 
 
 def test_effective_inflow_layer_cm1():
@@ -140,11 +148,56 @@ def test_bunkers_motion():
         eil, mupcl
     )
 
-    assert (storm_mtn.u == pytest.approx(9.74783))
-    assert (storm_mtn.v == pytest.approx(5.570305))
+    assert (storm_mtn.u == pytest.approx(9.65811))
+    assert (storm_mtn.v == pytest.approx(5.558156))
 
 
-def test_stp_scp_ship():
+def test_corfidi_vectors():
+    upshear, downshear = params.mcs_motion_corfidi(
+        snd_data["pres"],
+        snd_data["hght"],
+        snd_data["uwin"],
+        snd_data["vwin"]
+    )
+
+    assert (upshear.u == pytest.approx(12.7017, abs=1e-3))
+    assert (upshear.v == pytest.approx(2.99329, abs=1e-3))
+    assert (downshear.u == pytest.approx(23.2054, abs=1e-3))
+    assert (downshear.v == pytest.approx(16.10519, abs=1e-3))
+
+
+def test_effective_bulk_wind():
+    lifter = parcel.lifter_cm1()
+    lifter.ma_type = thermo.adiabat.pseudo_liq
+    mupcl = parcel.Parcel()
+    eil = params.effective_inflow_layer(
+        lifter,
+        snd_data["pres"],
+        snd_data["hght"],
+        snd_data["tmpk"],
+        snd_data["dwpk"],
+        snd_data["vtmp"],
+        mupcl=mupcl
+    )
+
+    ebwd_cmp = params.effective_bulk_wind_difference(
+        snd_data["pres"],
+        snd_data["hght"],
+        snd_data["uwin"],
+        snd_data["vwin"],
+        eil,
+        mupcl.eql_pressure
+    )
+
+    ebwd = winds.vector_magnitude(ebwd_cmp.u, ebwd_cmp.v)
+    assert (ebwd_cmp.u == pytest.approx(14.6, abs=1e-3))
+    assert (ebwd_cmp.v == pytest.approx(13.321, abs=1e-3))
+    assert (ebwd == pytest.approx(19.764, abs=1e-3))
+
+
+def test_stp_scp_ship_dcp_lhp():
+    lifter = parcel.lifter_cm1()
+    lifter.ma_type = thermo.adiabat.pseudo_liq
     # get the mixed-layer parcel
     mix_lyr = layer.PressureLayer(
         snd_data["pres"][0], snd_data["pres"][0] - 10000.0)
@@ -156,9 +209,26 @@ def test_stp_scp_ship():
         snd_data["mixr"]
     )
 
+    search_layer = layer.PressureLayer(
+        snd_data["pres"][0],
+        snd_data["pres"][0] - 40000.0
+    )
+
+    dcape_pcl = parcel.DowndraftParcel.min_thetae(
+        search_layer,
+        snd_data["pres"],
+        snd_data["tmpk"],
+        snd_data["dwpk"],
+        snd_data["thetae"]
+    )
+
+    dpcl_t = dcape_pcl.lower_parcel(lifter, snd_data["pres"])
+    dpcl_buoy = thermo.buoyancy(dpcl_t, snd_data["tmpk"])
+
+    dcape, dcinh = dcape_pcl.cape_cinh(
+        snd_data["pres"], snd_data["hght"], dpcl_buoy)
+
     # lift the parcel and get CAPE
-    lifter = parcel.lifter_cm1()
-    lifter.ma_type = thermo.adiabat.pseudo_liq
     vtmpk = pcl.lift_parcel(lifter, snd_data["pres"])
     buoy = thermo.buoyancy(vtmpk, snd_data["vtmp"])
     cape, cinh = pcl.cape_cinh(snd_data["pres"], snd_data["hght"], buoy)
@@ -191,24 +261,15 @@ def test_stp_scp_ship():
         snd_data["vwin"]
     )
 
-    # Get the effective bulk wind difference
-    eil_hght = layer.pressure_layer_to_height(
-        eil,
+    ebwd_cmp = params.effective_bulk_wind_difference(
         snd_data["pres"],
-        snd_data["hght"]
-    )
-    eql_hght = interp.interp_pressure(
-        mupcl.eql_pressure,
-        snd_data["pres"],
-        snd_data["hght"]
-    )
-    ebwd_lyr = layer.HeightLayer(eil_hght.bottom, 0.5*eql_hght)
-    ebwd_cmp = winds.wind_shear(
-        ebwd_lyr,
         snd_data["hght"],
         snd_data["uwin"],
-        snd_data["vwin"]
+        snd_data["vwin"],
+        eil,
+        mupcl.eql_pressure
     )
+
     ebwd = winds.vector_magnitude(ebwd_cmp.u, ebwd_cmp.v)
 
     # Get the LCL height in meters AGL
@@ -224,7 +285,7 @@ def test_stp_scp_ship():
         esrh,
         ebwd
     )
-    assert (stp == pytest.approx(0.4849648, abs=1e-4))
+    assert (stp == pytest.approx(0.48329, abs=1e-4))
 
     scp = params.supercell_composite_parameter(mupcl.cape, esrh, ebwd)
     assert (scp == pytest.approx(7.9699, abs=1e-1))
@@ -242,6 +303,27 @@ def test_stp_scp_ship():
     shr06 = winds.vector_magnitude(shr06.u, shr06.v)
     ship = params.significant_hail_parameter(mupcl, lr75, t500, fzl, shr06)
     assert (ship == pytest.approx(1.9521, abs=1e-3))
+
+    hlyr_in_p = layer.height_layer_to_pressure(hlyr, snd_data["pres"], snd_data["hght"])
+    mw06 = winds.mean_wind(
+        hlyr_in_p, snd_data["pres"], snd_data["uwin"], snd_data["vwin"]
+    )
+    mw06 = winds.vector_magnitude(mw06.u, mw06.v)
+    dcp = params.derecho_composite_parameter(dcape, mupcl.cape, shr06, mw06)
+    assert (dcp == pytest.approx(7.63, abs=1e-1))
+
+    hgz = params.hail_growth_layer(snd_data["pres"], snd_data["tmpk"])
+    lhp = params.large_hail_parameter(
+        mupcl, 
+        lr75, 
+        hgz, 
+        storm_mtn, 
+        snd_data["pres"], 
+        snd_data["hght"], 
+        snd_data["uwin"], 
+        snd_data["vwin"]
+    )
+    assert (lhp == pytest.approx(13.98, abs=1e-2))
 
 
 def test_ehi():
@@ -286,7 +368,7 @@ def test_ehi():
     )
 
     ehi = params.energy_helicity_index(pcl.cape, srh)
-    assert (ehi == pytest.approx(4.411969661))
+    assert (ehi == pytest.approx(4.41228, abs=1e-5))
 
 
 def test_precipitable_water():
@@ -306,3 +388,19 @@ def test_dgz():
     dgz = params.dendritic_layer(snd_data["pres"], snd_data["tmpk"])
     assert (dgz.bottom == 49598)
     assert (dgz.top == 46032)
+
+
+def test_fwwi():
+    fwwi = params.fosberg_fire_index(
+        308,
+        0.00001,
+        13.5
+    )
+    assert (fwwi == 100.0)
+
+    tmpk = np.array([308, 308, 308], dtype='float32')
+    relh = np.array([0.00001, 0.00001, 0.00001], dtype='float32')
+    wspd = np.array([13.5, 13.5, 13.5], dtype='float32')
+
+    fwwi = params.fosberg_fire_index(tmpk, relh, wspd)
+    assert (fwwi == np.array([100.0, 100.0, 100.0], dtype='float32')).all()

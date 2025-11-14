@@ -15,10 +15,13 @@
 #include "SHARPlib/params/convective.h"
 
 #include <SHARPlib/constants.h>
+#include <SHARPlib/interp.h>
 #include <SHARPlib/layer.h>
 #include <SHARPlib/parcel.h>
 #include <SHARPlib/thermo.h>
 #include <SHARPlib/winds.h>
+
+#include <utility>
 
 namespace sharp {
 
@@ -120,6 +123,55 @@ WindComponents storm_motion_bunkers(
     HeightLayer mw_layer = {eil_hght.bottom, htop};
     return storm_motion_bunkers(pressure, height, u_wind, v_wind, N, mw_layer,
                                 shr_layer, leftMover, true);
+}
+
+[[nodiscard]] std::pair<WindComponents, WindComponents> mcs_motion_corfidi(
+    const float pressure[], const float height[], const float u_wind[],
+    const float v_wind[], const std::ptrdiff_t N) {
+    const float pres_sfc = pressure[0];
+
+    WindComponents cloud_layer_mean;
+    if (pres_sfc < 85000.0f) {
+        cloud_layer_mean =
+            mean_wind({pres_sfc, 30000.0}, pressure, u_wind, v_wind, N, false);
+    } else {
+        cloud_layer_mean =
+            mean_wind({85000.0, 30000.0}, pressure, u_wind, v_wind, N, false);
+    }
+
+    HeightLayer low_layer = {0, 1500.0};  // agl
+    PressureLayer low_layer_pres =
+        height_layer_to_pressure(low_layer, pressure, height, N, true);
+
+    WindComponents low_level_mean =
+        mean_wind(low_layer_pres, pressure, u_wind, v_wind, N, false);
+
+    WindComponents upshear = {cloud_layer_mean.u - low_level_mean.u,
+                              cloud_layer_mean.v - low_level_mean.v};
+    WindComponents downshear = {cloud_layer_mean.u + upshear.u,
+                                cloud_layer_mean.v + upshear.v};
+
+    return std::make_pair(upshear, downshear);
+}
+
+WindComponents effective_bulk_wind_difference(
+    const float pressure[], const float height[], const float u_wind[],
+    const float v_wind[], const std::ptrdiff_t N,
+    sharp::PressureLayer effective_inflow_lyr,
+    const float equilibrium_level_pressure) {
+    if ((equilibrium_level_pressure == MISSING) ||
+        (effective_inflow_lyr.bottom == MISSING))
+        return {MISSING, MISSING};
+
+    sharp::HeightLayer eil_hght =
+        pressure_layer_to_height(effective_inflow_lyr, pressure, height, N);
+    float eql_hght =
+        interp_pressure(equilibrium_level_pressure, pressure, height, N);
+
+    float depth = 0.5f * (eql_hght - eil_hght.bottom);
+    sharp::HeightLayer ebwd_lyr = {eil_hght.bottom, eil_hght.bottom + depth};
+
+    return sharp::wind_shear(ebwd_lyr, height, u_wind, v_wind, N);
 }
 
 float entrainment_cape(const float pressure[], const float height[],
@@ -257,7 +309,7 @@ float significant_tornado_parameter(Parcel pcl, float lcl_hght_agl,
                                     float storm_relative_helicity,
                                     float bulk_wind_difference) {
     float cinh_term, lcl_term, shear_term, srh_term, cape_term;
-    if (pcl.cape == MISSING) return MISSING;
+    if (std::isnan(pcl.cinh)) return 0.0;
 
     if (pcl.cinh >= -50.0)
         cinh_term = 1.0;
@@ -328,6 +380,77 @@ float significant_hail_parameter(const sharp::Parcel &mu_pcl,
     return ship;
 }
 
+float derecho_composite_parameter(const float dcape, const float mucape,
+                                  const float shear_0_6km,
+                                  const float mean_wind_0_6km) {
+    return (std::abs(dcape) / 980.0f) * (mucape / 2000.0f) *
+           (shear_0_6km / 10.2889f) * (mean_wind_0_6km / 8.23111f);
+}
+
+float large_hail_parameter(const Parcel mu_pcl,
+                           const float lapse_rate_700_500mb,
+                           const PressureLayer hail_growth_zone,
+                           const WindComponents storm_motion,
+                           const float pressure[], const float height[],
+                           const float u_wind[], const float v_wind[],
+                           std::ptrdiff_t N) {
+    HeightLayer lyr_0_6km = {0.0f, 6000.0f};
+    WindComponents shr_0_6km = wind_shear(lyr_0_6km, height, u_wind, v_wind, N);
+    const float shr_spd_0_6km = vector_magnitude(shr_0_6km.u, shr_0_6km.v);
+
+    if ((shr_spd_0_6km < 14.f) || mu_pcl.cape < 400) return 0.0f;
+    if (mu_pcl.eql_pressure == MISSING) return 0.0f;
+
+    HeightLayer hgz_hght =
+        pressure_layer_to_height(hail_growth_zone, pressure, height, N, true);
+    const float hgz_depth = hgz_hght.top - hgz_hght.bottom;
+    const float TermA = ((mu_pcl.cape - 2000.0f) / 1000.0f) +
+                        ((3200.0f - hgz_depth) / 500.0f) +
+                        ((lapse_rate_700_500mb - 6.5f) / 2.f);
+
+    HeightLayer lyr_0_1km = {0.0, 1000.0};
+    HeightLayer lyr_3_6km = {3000.0, 6000.0};
+    const float el_hght =
+        interp_pressure(mu_pcl.eql_pressure, pressure, height, N);
+    HeightLayer el_lyr = {el_hght - 1500.0f, el_hght};
+    PressureLayer el_lyr_pres =
+        height_layer_to_pressure(el_lyr, pressure, height, N);
+    PressureLayer lyr_0_1km_pres =
+        height_layer_to_pressure(lyr_0_1km, pressure, height, N, true);
+    PressureLayer lyr_3_6km_pres =
+        height_layer_to_pressure(lyr_3_6km, pressure, height, N, true);
+    const WindComponents mw_el =
+        mean_wind(el_lyr_pres, pressure, u_wind, v_wind, N, false);
+    const WindComponents mw_0_1km =
+        mean_wind(lyr_0_1km_pres, pressure, u_wind, v_wind, N, false);
+    const WindComponents mw_3_6km =
+        mean_wind(lyr_3_6km_pres, pressure, u_wind, v_wind, N, false);
+    const WindComponents shear_el = {mw_el.u - u_wind[0], mw_el.v - v_wind[0]};
+    const WindComponents srw_3_6km = {mw_3_6km.u - storm_motion.u,
+                                      mw_3_6km.v - storm_motion.v};
+    const WindComponents srw_0_1km = {mw_0_1km.u - storm_motion.u,
+                                      mw_0_1km.v - storm_motion.v};
+    const WindVector shear_el_vec = components_to_vector(shear_el);
+    const WindVector mw_3_6km_vec = components_to_vector(mw_3_6km);
+    const WindVector srw_0_1km_vec = components_to_vector(srw_0_1km);
+    const WindVector srw_3_6km_vec = components_to_vector(srw_3_6km);
+
+    const float grw_alpha_el = shear_el_vec.direction - mw_3_6km_vec.direction;
+    const float srw_alpha_mid =
+        srw_3_6km_vec.direction - srw_0_1km_vec.direction;
+
+    const float grw_term =
+        (grw_alpha_el > 180.0) ? -10 : ((grw_alpha_el + 5.0f) / 20.0f);
+
+    const float TermB =
+        ((vector_magnitude(shear_el.u, shear_el.v) - 25.0f) / 5.0f) + grw_term +
+        ((srw_alpha_mid - 80.0f) / 10.0f);
+
+    if ((TermA < 0.0f) && (TermB < 0.0f)) return 0.0f;
+
+    return std::max(0.0f, (TermA * TermB) + 5.0f);
+}
+
 float precipitable_water(PressureLayer layer, const float pressure[],
                          const float mixing_ratio[], const std::ptrdiff_t N) {
     float pwat =
@@ -340,14 +463,19 @@ float precipitable_water(PressureLayer layer, const float pressure[],
 PressureLayer hail_growth_layer(const float pressure[],
                                 const float temperature[],
                                 const std::ptrdiff_t N) {
-    sharp::PressureLayer hgz = {sharp::MISSING, sharp::MISSING};
-
-    hgz.bottom =
+    float bottom =
         find_first_pressure(-10.0f + ZEROCNK, pressure, temperature, N);
-    hgz.top = find_first_pressure(-30.0f + ZEROCNK, pressure, temperature, N);
+    float top = find_first_pressure(-30.0f + ZEROCNK, pressure, temperature, N);
 
-    // do_stuff
-    return hgz;
+    if (top == MISSING) {
+        return {MISSING, MISSING};
+    }
+
+    if (bottom == MISSING) {
+        bottom = pressure[0];
+    }
+
+    return {bottom, top};
 }
 
 }  // end namespace sharp
